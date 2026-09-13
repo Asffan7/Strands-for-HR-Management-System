@@ -8,12 +8,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mcp.client.streamable_http import streamable_http_client
 from strands import Agent, tool
 from strands.models.mistral import MistralModel
 from strands.tools.mcp import MCPClient
 
-from app.configuration.config import Settings, get_settings
+from app.configuration.config import Settings, get_mcp_headers, get_settings
 from app.agentic_workflow.callbacks.workflow_callback_handler import WorkflowCallbackHandler
 from app.agentic_workflow.hooks.workflow_hooks import WorkflowHookProvider
 from app.agentic_workflow.instructions.system_instructions import WORKFLOW_SYSTEM_PROMPT
@@ -51,7 +50,10 @@ _MCP_CLIENTS: list[MCPClient] = []
 
 
 def _load_mcp_tools(settings: Settings) -> tuple[MCPClient, list[object]]:
-    client = MCPClient(lambda: streamable_http_client(settings.FRAPPE_MCP_URL.strip()))
+    client = MCPClient(
+        url=settings.FRAPPE_MCP_URL.strip(),
+        headers=get_mcp_headers(settings),
+    )
     client.start()
     atexit.register(lambda: client.stop(None, None, None))
     _MCP_CLIENTS.append(client)

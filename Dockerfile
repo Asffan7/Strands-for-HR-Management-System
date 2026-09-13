@@ -2,7 +2,9 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    FRAPPE_MCP_URL=http://localhost:8800/mcp \
+    FRAPPE_MCP_BEARER_TOKEN=""
 
 WORKDIR /app
 
