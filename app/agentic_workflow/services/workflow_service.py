@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import uuid
 from typing import Any
 
@@ -8,6 +9,8 @@ from strands.models.mistral import MistralModel
 from strands_tools import http_request
 
 from app.configuration.config import Settings, get_settings
+from app.database.repository import WorkflowRepository
+from app.database.session import get_session_factory
 from app.agentic_workflow.callbacks.workflow_callback_handler import WorkflowCallbackHandler
 from app.agentic_workflow.hooks.workflow_hooks import WorkflowHookProvider
 from app.agentic_workflow.instructions.system_instructions import DRAFT_SYSTEM_PROMPT, WORKFLOW_SYSTEM_PROMPT
@@ -16,6 +19,7 @@ from app.agentic_workflow.schemas.workflow_schemas import (
     LeaveEmailDraft,
     LeaveRiskAssessment,
     PendingReviewEmail,
+    SendEmailRequest,
     WorkflowEmployeeResult,
     WorkflowSummary,
 )
@@ -24,6 +28,28 @@ from app.agentic_workflow.services.mcp_service import get_employee_leave_balance
 
 
 _PENDING_REVIEWS: dict[str, PendingReviewEmail] = {}
+_PENDING_REVIEW_RUN_IDS: dict[str, str] = {}
+
+
+def _risk_category(risk: LeaveRiskAssessment) -> str:
+    if risk.is_lop_risk:
+        return "lop_risk"
+    if risk.is_low_balance:
+        return "low_balance"
+    return "normal"
+
+
+def _blocked_summary(run_id: str, reason: str) -> WorkflowSummary:
+    return WorkflowSummary(
+        status="blocked",
+        workflow_run_id=run_id,
+        blocked_reason=reason,
+        total_employees_processed=0,
+        sent_count=0,
+        pending_review_count=0,
+        failed_count=0,
+        results=[],
+    )
 
 
 def _extract_body_from_tool_result(result: dict[str, Any]) -> str:
@@ -66,7 +92,7 @@ def _build_draft_agent(settings: Settings) -> Agent:
         _build_model(settings),
         system_prompt=DRAFT_SYSTEM_PROMPT,
         callback_handler=WorkflowCallbackHandler(),
-        hooks=[WorkflowHookProvider()],
+        hooks=[WorkflowHookProvider(settings)],
         plugins=[WORKFLOW_SKILLS_PLUGIN],
     )
 
@@ -137,13 +163,17 @@ HR Manager
 
 
 def _send_email(employee: EmployeeLeave, draft: LeaveEmailDraft, email_api_base_url: str) -> WorkflowEmployeeResult:
-    send_payload = {
-        "employee_id": employee.employee_id,
-        "employee_name": employee.employee_name,
-        "employee_email": str(employee.employee_email),
-        "subject": draft.subject,
-        "body": draft.body,
-    }
+    employee_id_match = re.search(r"\d+$", employee.employee_id)
+    if employee_id_match is None:
+        raise ValueError(f"Employee ID must end with a numeric identifier: {employee.employee_id}")
+
+    send_payload = SendEmailRequest(
+        employee_id=int(employee_id_match.group()),
+        employee_name=employee.employee_name,
+        employee_email=employee.employee_email,
+        subject=draft.subject,
+        body=draft.body,
+    ).model_dump(mode="json")
 
     post_result = _call_http_tool(
         method="POST",
@@ -169,8 +199,43 @@ def trigger_leave_workflow() -> WorkflowSummary:
     if settings.BYPASS_TOOL_CONSENT:
         os.environ["BYPASS_TOOL_CONSENT"] = "true"
 
+    session_factory = get_session_factory(settings.DATABASE_URL)
+    with session_factory() as session:
+        repository = WorkflowRepository(session)
+        if not repository.can_start_workflow(settings.WORKFLOW_COOLDOWN_DAYS):
+            reason = (
+                f"Leave workflow cooldown is active for {settings.WORKFLOW_COOLDOWN_DAYS:g} days."
+            )
+            blocked_run = repository.create_run(
+                settings.WORKFLOW_COOLDOWN_DAYS,
+                status="blocked",
+                reason=reason,
+            )
+            session.commit()
+            return _blocked_summary(blocked_run.id, reason)
+
+        workflow_run = repository.create_run(settings.WORKFLOW_COOLDOWN_DAYS)
+        session.commit()
+
     email_api_base_url = settings.EMAIL_API_BASE_URL.rstrip("/")
-    employees = get_employee_leave_balances(settings)
+    try:
+        employees = get_employee_leave_balances(settings)
+    except Exception as exc:
+        with session_factory() as session:
+            repository = WorkflowRepository(session)
+            workflow_run = session.get(type(workflow_run), workflow_run.id)
+            if workflow_run is not None:
+                repository.finalize_run(
+                    workflow_run,
+                    total_employees=0,
+                    sent_count=0,
+                    pending_review_count=0,
+                    failed_count=0,
+                    status="failed",
+                    reason=str(exc),
+                )
+                session.commit()
+        raise
 
     results: list[WorkflowEmployeeResult] = []
 
@@ -184,6 +249,21 @@ def trigger_leave_workflow() -> WorkflowSummary:
                 draft=draft,
                 risk=risk,
             )
+            _PENDING_REVIEW_RUN_IDS[employee.employee_id] = workflow_run.id
+            with session_factory() as session:
+                repository = WorkflowRepository(session)
+                persisted_run = session.get(type(workflow_run), workflow_run.id)
+                if persisted_run is not None:
+                    repository.record_email_event(
+                        persisted_run,
+                        employee,
+                        draft.subject,
+                        draft.body,
+                        _risk_category(risk),
+                        "pending_review",
+                        "Low leave balance/LOP risk detected. Pending human approval.",
+                    )
+                    session.commit()
             results.append(
                 WorkflowEmployeeResult(
                     employee_id=employee.employee_id,
@@ -196,23 +276,51 @@ def trigger_leave_workflow() -> WorkflowSummary:
             continue
 
         try:
-            results.append(_send_email(employee, draft, email_api_base_url))
+            result = _send_email(employee, draft, email_api_base_url)
         except Exception as exc:
-            results.append(
-                WorkflowEmployeeResult(
-                    employee_id=employee.employee_id,
-                    employee_name=employee.employee_name,
-                    employee_email=employee.employee_email,
-                    status="failed",
-                    message=f"Failed to send email: {exc}",
-                )
+            result = WorkflowEmployeeResult(
+                employee_id=employee.employee_id,
+                employee_name=employee.employee_name,
+                employee_email=employee.employee_email,
+                status="failed",
+                message=f"Failed to send email: {exc}",
             )
+        with session_factory() as session:
+            repository = WorkflowRepository(session)
+            persisted_run = session.get(type(workflow_run), workflow_run.id)
+            if persisted_run is not None:
+                repository.record_email_event(
+                    persisted_run,
+                    employee,
+                    draft.subject,
+                    draft.body,
+                    _risk_category(risk),
+                    result.status,
+                    result.message,
+                )
+                session.commit()
+        results.append(result)
 
     sent_count = len([r for r in results if r.status == "sent"])
     pending_count = len([r for r in results if r.status == "pending_review"])
     failed_count = len([r for r in results if r.status == "failed"])
 
+    with session_factory() as session:
+        repository = WorkflowRepository(session)
+        persisted_run = session.get(type(workflow_run), workflow_run.id)
+        if persisted_run is not None:
+            repository.finalize_run(
+                persisted_run,
+                total_employees=len(results),
+                sent_count=sent_count,
+                pending_review_count=pending_count,
+                failed_count=failed_count,
+            )
+            session.commit()
+
     return WorkflowSummary(
+        status="completed",
+        workflow_run_id=workflow_run.id,
         total_employees_processed=len(results),
         sent_count=sent_count,
         pending_review_count=pending_count,
@@ -235,6 +343,16 @@ def review_pending_email(employee_id: str, action: str) -> WorkflowEmployeeResul
 
     if action == "reject":
         _PENDING_REVIEWS.pop(employee_id, None)
+        run_id = _PENDING_REVIEW_RUN_IDS.pop(employee_id, None)
+        if run_id is not None:
+            with get_session_factory(settings.DATABASE_URL)() as session:
+                WorkflowRepository(session).update_event_status(
+                    run_id,
+                    employee_id,
+                    "rejected",
+                    "Email draft rejected by human reviewer.",
+                )
+                session.commit()
         return WorkflowEmployeeResult(
             employee_id=pending.employee.employee_id,
             employee_name=pending.employee.employee_name,
@@ -245,6 +363,16 @@ def review_pending_email(employee_id: str, action: str) -> WorkflowEmployeeResul
 
     result = _send_email(pending.employee, pending.draft, email_api_base_url)
     _PENDING_REVIEWS.pop(employee_id, None)
+    run_id = _PENDING_REVIEW_RUN_IDS.pop(employee_id, None)
+    if run_id is not None:
+        with get_session_factory(settings.DATABASE_URL)() as session:
+            WorkflowRepository(session).update_event_status(
+                run_id,
+                employee_id,
+                result.status,
+                result.message,
+            )
+            session.commit()
     return result
 
 

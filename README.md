@@ -21,7 +21,8 @@ Before starting the agent, complete these prerequisite steps in order:
 2. Generate an API key and API secret for that Frappe user.
 3. Add the Frappe URL and generated credentials to the MCP server's `.env`.
 4. Add the Mistral key and MCP URL to this repository's `.env`.
-5. Start Frappe, the MCP server, and this repository's API.
+5. Initialize the SQLite database with the Alembic migration.
+6. Start Frappe, the MCP server, and this repository's API.
 
 ## Create Frappe API credentials
 
@@ -125,6 +126,10 @@ MISTRAL_API_KEY=<mistral-api-key>
 # MCP endpoint exposed by the Frappe MCP server
 FRAPPE_MCP_URL=http://localhost:8800/mcp
 
+# SQLite database and workflow cooldown
+DATABASE_URL=sqlite:///data/hr_management.db
+WORKFLOW_COOLDOWN_DAYS=15
+
 # Optional employee search and workflow settings
 MCP_EMPLOYEE_QUERY=*
 LOW_LEAVE_THRESHOLD_DAYS=2.0
@@ -147,6 +152,29 @@ not used by this application. They must be configured in the MCP server as
 shown above. This application connects to Frappe indirectly through
 `FRAPPE_MCP_URL`.
 
+## Initialize the database
+
+The application stores workflow runs and per-email audit events in SQLite. The
+default database is `data/hr_management.db`, and `DATABASE_URL` can override
+that location. Run the migration after installing dependencies and before
+starting the API or leave agent:
+
+```bash
+alembic upgrade head
+```
+
+`WORKFLOW_COOLDOWN_DAYS` controls repeat workflow execution. Set it to `0` to
+allow every run. The example value `15` allows a new leave
+workflow only after 15 full days have elapsed since the latest completed leave
+workflow. A blocked trigger is recorded in the database with status `blocked`,
+and it does not call the MCP server, Mistral, or email API.
+
+Each completed workflow records its trigger and completion metadata, aggregate
+counts, and one email audit event per employee. Email events include recipient,
+subject, full generated body, leave values, risk category, delivery status, and
+provider message. The local database contains employee-related data; protect
+it like other application data and do not commit the `data/` directory.
+
 ## Start the repository API
 
 With the virtual environment activated, start the FastAPI service from the
@@ -164,10 +192,42 @@ http://127.0.0.1:8001/docs
 
 The API provides these workflow endpoints:
 
+- `GET /health` confirms that the repository API process is running.
 - `POST /agent/trigger` runs the leave workflow.
 - `GET /agent/pending-reviews` lists low-balance emails waiting for approval.
 - `POST /agent/pending-reviews/{employee_id}` accepts a review action.
 - `POST /leaves/send_email` is the local mock email endpoint used by the workflow.
+
+The workflow audit API is available under `/workflows`. List endpoints return a
+paginated object with `items`, `total`, `limit`, and `offset` fields.
+
+- `POST /workflows/trigger` creates a workflow run by triggering the leave workflow.
+- `GET /workflows` lists workflow runs. Optional query parameters are
+  `status`, `workflow_type`, `limit`, and `offset`.
+- `GET /workflows/{run_id}` returns one workflow run and its metadata.
+- `DELETE /workflows/{run_id}` deletes a workflow run and its email audit events.
+- `GET /workflows/{run_id}/emails` lists the employees and email outcomes for a
+  run. Optional query parameters are `delivery_status`, `limit`, and `offset`.
+- `GET /workflows/{run_id}/emails/{event_id}` returns one employee email event,
+  including recipient, subject, body, leave values, risk category, and status.
+- `PATCH /workflows/{run_id}/emails/{event_id}` updates an event's delivery
+  status and provider message.
+- `DELETE /workflows/{run_id}/emails/{event_id}` deletes one email audit event.
+
+For example, list all email events for a workflow and filter to pending reviews:
+
+```bash
+curl http://127.0.0.1:8001/workflows/<workflow-run-id>/emails
+curl 'http://127.0.0.1:8001/workflows/<workflow-run-id>/emails?delivery_status=pending_review'
+```
+
+Update an event after a human review:
+
+```bash
+curl -X PATCH http://127.0.0.1:8001/workflows/<workflow-run-id>/emails/<event-id> \
+  -H 'Content-Type: application/json' \
+  -d '{"delivery_status":"rejected","provider_message":"Rejected by HR reviewer"}'
+```
 
 ## Run the leave agent
 

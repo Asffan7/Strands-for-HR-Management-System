@@ -78,6 +78,8 @@ async def get_employee_leave_balances() -> list[EmployeeLeave]:
 
 @router.post("/send_email", response_model=SendEmailResponse)
 async def send_email(payload: SendEmailRequest) -> SendEmailResponse:
+    print("/n")
+    print(payload.model_dump_json())
     return SendEmailResponse(
         status="sent",
         message=f"Email queued for {payload.employee_name} <{payload.employee_email}>",

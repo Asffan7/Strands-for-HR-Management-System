@@ -1,11 +1,9 @@
-import atexit
 import logging
 import os
+import sys
 
-from mcp.client.streamable_http import streamable_http_client
 from strands import Agent, tool
 from strands.models.mistral import MistralModel
-from strands.tools.mcp import MCPClient
 
 from app.configuration.config import Settings, get_settings
 from app.agentic_workflow.callbacks.workflow_callback_handler import WorkflowCallbackHandler
@@ -41,23 +39,8 @@ def run_leave_email_workflow() -> WorkflowSummary:
     return trigger_leave_workflow()
 
 
-_MCP_CLIENTS: list[MCPClient] = []
-
-
-def _load_mcp_tools(settings: Settings) -> tuple[MCPClient, list[object]]:
-    client = MCPClient(lambda: streamable_http_client(settings.FRAPPE_MCP_URL.strip()))
-    client.start()
-    atexit.register(lambda: client.stop(None, None, None))
-    _MCP_CLIENTS.append(client)
-    tools = client.list_tools_sync(
-        tool_filters={"allowed": ["hrms_find_employee", "hrms_get_leave_balance"]}
-    )
-    return client, list(tools)
-
-
 def build_leave_agent() -> Agent:
     settings = get_settings()
-    _, mcp_tools = _load_mcp_tools(settings)
     model = MistralModel(
         api_key=settings.MISTRAL_API_KEY,
         client_args={"server_url": settings.MISTRAL_SERVER_URL.strip()},
@@ -66,10 +49,10 @@ def build_leave_agent() -> Agent:
 
     agent = Agent(
         model,
-        tools=[run_leave_email_workflow, *mcp_tools],
+        tools=[run_leave_email_workflow],
         system_prompt=WORKFLOW_SYSTEM_PROMPT,
         callback_handler=WorkflowCallbackHandler(),
-        hooks=[WorkflowHookProvider()],
+        hooks=[WorkflowHookProvider(settings)],
         plugins=[WORKFLOW_SKILLS_PLUGIN],
     )
     return agent
@@ -78,18 +61,35 @@ def build_leave_agent() -> Agent:
 agent: Agent | None = None
 
 
+def _terminal_workflow_failure(response: object) -> str | None:
+    state = getattr(response, "state", None)
+    if isinstance(state, dict):
+        failure = state.get(WorkflowHookProvider._TERMINAL_FAILURE_KEY)
+        if failure:
+            return str(failure)
+    return None
+
+
 if __name__ == "__main__":
     configure_verbose_logging()
     agent = build_leave_agent()
-    response = agent(
-        """
-        Trigger the leave email workflow now.
-        Use hrms_find_employee and hrms_get_leave_balance from the connected MCP server
-        when inspecting employee leave data.
-        Use the run_leave_email_workflow tool. Fetch leave balances, draft
-        personalized emails, send safe emails, and place low-balance or
-        Loss-of-Pay risk emails into human review.
-        """
-    )
+    try:
+        response = agent(
+            """
+            Trigger the leave email workflow now.
+            Use only the run_leave_email_workflow tool. Do not call MCP tools
+            directly; the workflow tool performs the employee lookup, drafting,
+            delivery, and human-review handling after the cooldown check.
+            """
+        )
+    except Exception as exc:
+        print(f"Leave workflow failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    failure = _terminal_workflow_failure(response)
+    if failure:
+        print(failure, file=sys.stderr)
+        raise SystemExit(1)
+
     print("\nFinal workflow response:")
     print(response)

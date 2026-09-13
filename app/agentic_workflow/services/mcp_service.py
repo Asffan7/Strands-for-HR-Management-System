@@ -49,15 +49,32 @@ def _result_payload(result: Any) -> Any:
 
 
 def _items(payload: Any, *keys: str) -> list[dict[str, Any]]:
+    if isinstance(payload, str):
+        try:
+            return _items(json.loads(payload), *keys)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "MCP returned a non-JSON text payload"
+            ) from exc
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)]
     if isinstance(payload, dict):
+        if payload.get("error"):
+            status_code = payload.get("status_code")
+            status_suffix = f" (status {status_code})" if status_code else ""
+            raise ValueError(f"MCP tool failed{status_suffix}: {payload['error']}")
         for key in keys:
             value = payload.get(key)
             if isinstance(value, list):
                 return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, (dict, str)):
+                return _items(value, *keys)
+        for key in ("data", "result", "items"):
+            value = payload.get(key)
+            if isinstance(value, (dict, list, str)):
+                return _items(value, *keys)
         return [payload]
-    raise ValueError("MCP returned an unsupported payload")
+    raise ValueError(f"MCP returned an unsupported payload type: {type(payload).__name__}")
 
 
 def _first_value(data: dict[str, Any], *keys: str) -> Any:
@@ -107,6 +124,28 @@ def _balance_record(data: dict[str, Any]) -> tuple[float, float, float]:
     return allocated_value, used_value, remaining_value
 
 
+def _balance_totals(items: list[dict[str, Any]]) -> tuple[float, float, float]:
+    allocated_total = 0.0
+    remaining_total = 0.0
+    for item in items:
+        allocated = _first_value(item, "total_leave_balance_allocated", "allocated", "total_allocated")
+        remaining = _first_value(
+            item,
+            "leave_balance_remaining",
+            "remaining",
+            "remaining_leave",
+            "balance",
+        )
+        if allocated is None and remaining is None:
+            continue
+        try:
+            allocated_total += float(allocated or 0)
+            remaining_total += float(remaining or 0)
+        except (TypeError, ValueError):
+            continue
+    return allocated_total, allocated_total - remaining_total, remaining_total
+
+
 @contextmanager
 def mcp_client(settings: Settings) -> Iterator[MCPClient]:
     client = MCPClient(lambda: streamable_http_client(settings.FRAPPE_MCP_URL.strip()))
@@ -116,11 +155,16 @@ def mcp_client(settings: Settings) -> Iterator[MCPClient]:
 
 def get_employee_leave_balances(settings: Settings) -> list[EmployeeLeave]:
     with mcp_client(settings) as client:
-        employee_query = {"query": settings.MCP_EMPLOYEE_QUERY, "status": "Active", "limit": 50}
+        query = settings.MCP_EMPLOYEE_QUERY.strip()
+        employee_query = {
+            "query": "" if query == "*" else query,
+            "status": "Active",
+            "limit": 50,
+        }
         employees_result = client.call_tool_sync(
             tool_use_id=f"find-employees-{uuid.uuid4()}",
             name="hrms_find_employee",
-            arguments=employee_query,
+            arguments={"params": employee_query},
         )
         employee_items = _items(_result_payload(employees_result), "employees", "data", "results")
         employees: list[EmployeeLeave] = []
@@ -133,11 +177,11 @@ def get_employee_leave_balances(settings: Settings) -> list[EmployeeLeave]:
             balance_result = client.call_tool_sync(
                 tool_use_id=f"leave-balance-{uuid.uuid4()}",
                 name="hrms_get_leave_balance",
-                arguments=balance_input,
+                arguments={"params": balance_input},
             )
             balance_payload = _result_payload(balance_result)
-            balance_items = _items(balance_payload, "balance", "data", "result")
-            allocated, used, remaining = _balance_record(balance_items[0])
+            balance_items = _items(balance_payload, "balances", "balance", "data", "result")
+            allocated, used, remaining = _balance_totals(balance_items)
             employees.append(
                 EmployeeLeave(
                     employee_id=employee_id,

@@ -5,6 +5,7 @@ from app.agentic_workflow.schemas.workflow_schemas import (
     PendingReviewEmail,
     PendingReviewsResponse,
     ReviewDecisionRequest,
+    SendEmailRequest,
     TriggerWorkflowRequest,
     WorkflowEmployeeResult,
     WorkflowSummary,
