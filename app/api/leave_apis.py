@@ -44,12 +44,6 @@ class SendEmailResponse(BaseModel):
     message: str
 
 
-EMPLOYEES = [
-    {"employee_id": 101, "employee_name": "Aarav Sharma", "employee_email": "aarav.sharma@example.com"},
-    {"employee_id": 102, "employee_name": "Isha Verma", "employee_email": "isha.verma@example.com"},
-    {"employee_id": 103, "employee_name": "Rohan Iyer", "employee_email": "rohan.iyer@example.com"},
-    {"employee_id": 104, "employee_name": "Neha Joshi", "employee_email": "neha.joshi@example.com"},
-]
 
 
 @router.get("/leave_balances", response_model=LeaveBalance)
@@ -64,27 +58,6 @@ async def get_leave() -> LeaveBalance:
         leave_balance_remaining=leave_balance_remaining,
     )
 
-
-@router.get("/employee_leave_balances", response_model=list[EmployeeLeave])
-async def get_employee_leave_balances() -> list[EmployeeLeave]:
-    employee_leaves: list[EmployeeLeave] = []
-    for employee in EMPLOYEES:
-        total_allocated = random.randint(10, 24)
-        used = round(random.uniform(0, total_allocated), 1)
-        remaining = round(total_allocated - used, 1)
-
-        employee_leaves.append(
-            EmployeeLeave(
-                employee_id=employee["employee_id"],
-                employee_name=employee["employee_name"],
-                employee_email=employee["employee_email"],
-                total_leave_balance_allocated=total_allocated,
-                leave_balance_used_this_month=used,
-                leave_balance_remaining=remaining,
-            )
-        )
-
-    return employee_leaves
 
 
 @router.post("/send_email", response_model=SendEmailResponse)

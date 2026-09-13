@@ -6,6 +6,7 @@ from sqlalchemy import engine_from_config, pool
 from app.configuration.config import get_settings
 from app.database.session import _ensure_sqlite_directory
 from app.models.base import Base
+from app.models import chat  # noqa: F401
 from app.models import workflow  # noqa: F401
 
 config = context.config

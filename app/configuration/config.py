@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     LOW_LEAVE_THRESHOLD_RATIO: float = Field(0.15)
     HITL_ENABLED: bool = Field(True)
     BYPASS_TOOL_CONSENT: bool = Field(True)
+    CHAT_HISTORY_LIMIT: int = Field(5, ge=1, le=50)
 
 
 def get_settings() -> Settings:
