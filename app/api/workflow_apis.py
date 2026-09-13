@@ -104,6 +104,56 @@ async def list_workflow_emails(
     return await run_in_threadpool(query)
 
 
+@router.get("/{run_id}/sent-emails", response_model=WorkflowEmailEventListResponse)
+async def list_sent_workflow_emails(
+    run_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> WorkflowEmailEventListResponse:
+    def query():
+        with _session_factory()() as session:
+            _get_run_or_404(session, run_id)
+            events, total = WorkflowRepository(session).list_email_events(
+                run_id,
+                limit=limit,
+                offset=offset,
+                delivery_status="sent",
+            )
+            return WorkflowEmailEventListResponse(
+                items=events,
+                total=total,
+                limit=limit,
+                offset=offset,
+            )
+
+    return await run_in_threadpool(query)
+
+
+@router.get("/{run_id}/pending-emails", response_model=WorkflowEmailEventListResponse)
+async def list_pending_workflow_emails(
+    run_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> WorkflowEmailEventListResponse:
+    def query():
+        with _session_factory()() as session:
+            _get_run_or_404(session, run_id)
+            events, total = WorkflowRepository(session).list_email_events(
+                run_id,
+                limit=limit,
+                offset=offset,
+                delivery_status="pending_review",
+            )
+            return WorkflowEmailEventListResponse(
+                items=events,
+                total=total,
+                limit=limit,
+                offset=offset,
+            )
+
+    return await run_in_threadpool(query)
+
+
 @router.get("/{run_id}/emails/{event_id}", response_model=WorkflowEmailEventResponse)
 async def get_workflow_email(run_id: str, event_id: int) -> WorkflowEmailEventResponse:
     def query():
