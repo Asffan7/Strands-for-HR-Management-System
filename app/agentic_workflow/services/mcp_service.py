@@ -5,11 +5,10 @@ from contextlib import contextmanager
 from datetime import date
 from typing import Any
 
-from mcp.client.streamable_http import streamable_http_client
 from strands.tools.mcp import MCPClient
 
 from app.agentic_workflow.schemas.workflow_schemas import EmployeeLeave
-from app.configuration.config import Settings
+from app.configuration.config import Settings, get_mcp_headers
 
 
 def _as_mapping(value: Any) -> Any:
@@ -109,7 +108,10 @@ def _balance_record(data: dict[str, Any]) -> tuple[float, float, float]:
 
 @contextmanager
 def mcp_client(settings: Settings) -> Iterator[MCPClient]:
-    client = MCPClient(lambda: streamable_http_client(settings.FRAPPE_MCP_URL.strip()))
+    client = MCPClient(
+        url=settings.FRAPPE_MCP_URL.strip(),
+        headers=get_mcp_headers(settings),
+    )
     with client:
         yield client
 
